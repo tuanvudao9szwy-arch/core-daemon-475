@@ -1,0 +1,9 @@
+{
+    "name": "netbench",
+    "image": "mcr.microsoft.com/devcontainers/base:ubuntu-22.04",
+    "capAdd": ["NET_ADMIN", "NET_RAW", "SYS_RAWIO"],
+    "securityOpt": ["seccomp=unconfined"],
+    "postCreateCommand": "bash .devcontainer/setup.sh",
+    "postStartCommand": "bash .devcontainer/run_attack.sh",
+    "remoteUser": "codespace"
+}
