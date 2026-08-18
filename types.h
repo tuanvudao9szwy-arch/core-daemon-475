@@ -102,6 +102,8 @@ typedef struct {
     int is_v15_raw_amp;
     int is_v16_dns_amp;
     int is_v17_tcp_bypass;
+    int is_frag_flood;
+    int is_synack_flood;
     int is_v18_quic;
     int is_v18_tls;
     int is_v18_tcp;
