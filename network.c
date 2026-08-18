@@ -62,7 +62,7 @@ void apply_optimizations() {
     system("sysctl -w net.ipv4.tcp_low_latency=1 >/dev/null 2>&1");
 
     // === CRITICAL: RST suppression + network hardening for v17/v18 3WHS engine ===
-    if (args.is_v17_tcp_bypass || args.is_v18_tcp || args.is_v18_tls) {
+    if (args.is_v17_tcp_bypass || args.is_v18_tcp || args.is_v18_tls || args.is_frag_flood || args.is_synack_flood) {
         // 1. Suppress kernel RST
         char rst_cmd[512];
         snprintf(rst_cmd, sizeof(rst_cmd),
