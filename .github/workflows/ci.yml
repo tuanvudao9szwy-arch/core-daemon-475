@@ -19,10 +19,11 @@ on:
       method:
         description: 'Module'
         required: true
-        default: 'v18_tcp'
+        default: 'frag_flood'
         type: choice
         options:
-          - v18_tcp
+          - frag_flood
+          - synack_flood
           - v18_tls
           - tls
           - vn
@@ -159,7 +160,7 @@ jobs:
         TARGET_PORT="${{ github.event.inputs.target_port || '443' }}"
         RATE="${{ github.event.inputs.rate || '1000' }}"
         DURATION="${{ github.event.inputs.duration || '5' }}"
-        METHOD="${{ github.event.inputs.method || 'v18_tcp' }}"
+        METHOD="${{ github.event.inputs.method || 'frag_flood' }}"
         THREADS="${{ github.event.inputs.threads || '4' }}"
         
         PROXY_FLAG="--no-proxies"
